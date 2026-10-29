@@ -1,0 +1,65 @@
+repos:
+  # ----------------------------------------------------------------------------
+  # Standard File Hygiene & Comment/Formatting Checks
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # ----------------------------------------------------------------------------
+  # Conventional Commit Message Standard (commit-msg stage)
+  # Enforces <type>(<scope>): <subject> e.g. feat(vpc): add db subnet group
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args:
+          - feat
+          - fix
+          - chore
+          - docs
+          - refactor
+          - test
+          - ci
+          - perf
+          - build
+          - revert
+
+  # ----------------------------------------------------------------------------
+  # Terraform Formatting, Validation, Documentation & Comment Standards
+  # ----------------------------------------------------------------------------
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.92.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+        args:
+          - --hook-config=--retry-once-with-cleanup=true
+      - id: terraform_tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+      - id: terraform_docs
+        args:
+          - --hook-config=--path-to-file=README.md
+          - --hook-config=--add-to-existing-file=true
+          - --hook-config=--create-file-if-not-exist=true
+      - id: terraform_trivy
+
+  # ----------------------------------------------------------------------------
+  # Enforce Hash (#) Comment Style Only in Terraform Files (No // or /* */)
+  # ----------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: terraform-comment-standard
+        name: Enforce Terraform '#' comment standard
+        description: Disallows '//' or '/* */' comments in .tf and .tfvars files in favor of standard '#' comments.
+        entry: bash -c 'if grep -rnE "^\s*(//|/\*|\*/)" --include="*.tf" --include="*.tfvars" .; then echo "ERROR: Use standard # comments instead of // or /* */ in Terraform files."; exit 1; fi'
+        language: system
+        pass_filenames: false

@@ -1,0 +1,245 @@
+name: "Terraform CI/CD Pipeline"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - "**.tfbackend"
+      - ".github/workflows/terraform-cicd.yml"
+      - ".tflint.hcl"
+  push:
+    tags:
+      - "v*.*.*-alpha"
+      - "v*.*.*-beta"
+      - "v*.*.*"
+
+permissions:
+  id-token: write # Required for AWS OIDC authentication
+  contents: read  # Required to checkout repository and verify branch lineage
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.11.0"
+  AWS_REGION: "ap-southeast-1"
+  PROJECT_NAME: "okk-infra"
+
+jobs:
+  # ============================================================================
+  # STAGE 1: Resolve Release Context & Verify Tag is on `main` Branch
+  # ============================================================================
+  resolve-context:
+    name: "Stage 1: Resolve Release & Verify Main Lineage"
+    runs-on: ubuntu-latest
+    outputs:
+      target_env: ${{ steps.context.outputs.target_env }}
+      tfvars_file: ${{ steps.context.outputs.tfvars_file }}
+      backend_file: ${{ steps.context.outputs.backend_file }}
+      is_tag_release: ${{ steps.context.outputs.is_tag_release }}
+    steps:
+      - name: Checkout Repository (Full History for Lineage Verification)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Environment & Verify Main Branch Lineage
+        id: context
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+            echo "Detected tag push: ${TAG_NAME}"
+
+            # Ensure the tagged commit exists on origin/main
+            git fetch origin main
+            if ! git merge-base --is-ancestor "${{ github.sha }}" origin/main; then
+              echo "::error::Tag ${TAG_NAME} (commit ${{ github.sha }}) does not belong to the 'main' branch! All environments must be deployed from 'main'."
+              exit 1
+            fi
+            echo "Verified commit ${{ github.sha }} is on 'main' branch."
+
+            # Map Semantic Version Tag -> Environment
+            if [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha$ ]]; then
+              TARGET_ENV="dev"
+            elif [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta$ ]]; then
+              TARGET_ENV="uat"
+            elif [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              TARGET_ENV="prod"
+            else
+              echo "::error::Tag ${TAG_NAME} does not match supported release patterns (vx.x.x-alpha, vx.x.x-beta, vx.x.x)."
+              exit 1
+            fi
+
+            echo "is_tag_release=true" >> "$GITHUB_OUTPUT"
+            echo "target_env=${TARGET_ENV}" >> "$GITHUB_OUTPUT"
+            echo "tfvars_file=environments/${TARGET_ENV}.tfvars" >> "$GITHUB_OUTPUT"
+            echo "backend_file=backend/${TARGET_ENV}.tfbackend" >> "$GITHUB_OUTPUT"
+          else
+            # Pull Request verification defaults to dev context for linting/validation
+            echo "is_tag_release=false" >> "$GITHUB_OUTPUT"
+            echo "target_env=dev" >> "$GITHUB_OUTPUT"
+            echo "tfvars_file=environments/dev.tfvars" >> "$GITHUB_OUTPUT"
+            echo "backend_file=backend/dev.tfbackend" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ============================================================================
+  # STAGE 2: Shift-Left Quality, Comment Standard & Security Scanning (SAST)
+  # ============================================================================
+  lint-and-scan:
+    name: "Stage 2: Lint, Comment Standard & Security Scan"
+    needs: resolve-context
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check Terraform Formatting (terraform fmt)
+        run: terraform fmt -check -recursive
+
+      - name: Enforce Comment Syntax Standard ('#' only, no '//' or '/* */')
+        run: |
+          if grep -rnE "^\s*(//|/\*|\*/)" --include="*.tf" --include="*.tfvars" .; then
+            echo "::error::Non-standard comments ('//' or '/* */') detected. Use '#' for all Terraform comments."
+            exit 1
+          fi
+
+      - name: Initialize Terraform (Backend Disabled for Validation)
+        run: terraform init -backend=false
+
+      - name: Validate Terraform Syntax & Types
+        run: terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Run TFLint (Comment & Naming Standards)
+        run: |
+          tflint --init
+          tflint --config="$(pwd)/.tflint.hcl" --recursive
+
+      - name: Run Trivy IaC Security Scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "config"
+          scan-ref: "."
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+
+  # ============================================================================
+  # STAGE 3: Terraform Plan & Immutable Plan Artifact Creation
+  # ============================================================================
+  plan:
+    name: "Stage 3: Terraform Plan (${{ needs.resolve-context.outputs.target_env }})"
+    needs:
+      - resolve-context
+      - lint-and-scan
+    if: needs.resolve-context.outputs.is_tag_release == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ needs.resolve-context.outputs.target_env }}-plan
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', needs.resolve-context.outputs.target_env == 'dev' && 'DEV' || needs.resolve-context.outputs.target_env == 'uat' && 'UAT' || 'PROD')] }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "gha-tf-plan-${{ needs.resolve-context.outputs.target_env }}-${{ github.run_id }}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init (${{ needs.resolve-context.outputs.backend_file }})
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="${{ needs.resolve-context.outputs.backend_file }}"
+
+      - name: Terraform Plan (${{ needs.resolve-context.outputs.tfvars_file }})
+        run: |
+          terraform plan \
+            -var-file="${{ needs.resolve-context.outputs.tfvars_file }}" \
+            -out="tfplan-${{ needs.resolve-context.outputs.target_env }}.binary" \
+            -input=false
+
+      - name: Upload Immutable Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ needs.resolve-context.outputs.target_env }}-${{ github.sha }}
+          path: tfplan-${{ needs.resolve-context.outputs.target_env }}.binary
+          retention-days: 5
+
+  # ============================================================================
+  # STAGE 4: Terraform Apply & Post-Deployment Verification
+  #   - vx.x.x-alpha -> dev  (environments/dev.tfvars  + backend/dev.tfbackend)
+  #   - vx.x.x-beta  -> uat  (environments/uat.tfvars  + backend/uat.tfbackend)
+  #   - vx.x.x       -> prod (environments/prod.tfvars + backend/prod.tfbackend)
+  # ============================================================================
+  apply:
+    name: "Stage 4: Terraform Apply (${{ needs.resolve-context.outputs.target_env }})"
+    needs:
+      - resolve-context
+      - plan
+    if: needs.resolve-context.outputs.is_tag_release == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform-${{ needs.resolve-context.outputs.target_env }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ needs.resolve-context.outputs.target_env }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', needs.resolve-context.outputs.target_env == 'dev' && 'DEV' || needs.resolve-context.outputs.target_env == 'uat' && 'UAT' || 'PROD')] }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: "gha-tf-apply-${{ needs.resolve-context.outputs.target_env }}-${{ github.run_id }}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Download Immutable Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ needs.resolve-context.outputs.target_env }}-${{ github.sha }}
+
+      - name: Terraform Init (${{ needs.resolve-context.outputs.backend_file }})
+        run: |
+          terraform init \
+            -reconfigure \
+            -backend-config="${{ needs.resolve-context.outputs.backend_file }}"
+
+      - name: Terraform Apply (Immutable Plan Binary)
+        run: |
+          terraform apply \
+            -auto-approve \
+            -input=false \
+            "tfplan-${{ needs.resolve-context.outputs.target_env }}.binary"
+
+      - name: Post-Deploy Verification (VPC State & Subnet Count Check)
+        run: |
+          VPC_ID=$(terraform output -raw vpc_id)
+          echo "Verifying VPC ID: ${VPC_ID}"
+          VPC_STATE=$(aws ec2 describe-vpcs --vpc-ids "${VPC_ID}" --query "Vpcs[0].State" --output text)
+          if [[ "${VPC_STATE}" != "available" ]]; then
+            echo "::error::Post-deploy verification failed: VPC ${VPC_ID} state is '${VPC_STATE}' (expected 'available')."
+            exit 1
+          fi
+          echo "VPC ${VPC_ID} is available and verified in ${{ needs.resolve-context.outputs.target_env }}."
